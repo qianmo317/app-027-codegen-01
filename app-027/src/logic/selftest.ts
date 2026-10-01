@@ -1,10 +1,29 @@
 import { PATTERN_LIBRARY, fetchPatternText } from '@/data/patterns'
 import { defaultMaterials } from '@/data/materials'
-import { DEFAULT_CUT_SETTINGS, type CutSettings, type MaterialPreset, type Pt, type Shape } from './types'
+import { DEFAULT_CUT_SETTINGS, type CutSettings, type MaterialPreset, type Project, type Pt, type Shape } from './types'
 import { cleanupContours } from './cleanup'
 import { importSvgText } from './importer'
-import { computeShape } from './pipeline'
-import { buildJob } from './job'
+import { computeShape, type ComputedShape } from './pipeline'
+import { buildBatchShape, buildJob, type Job } from './job'
+import {
+  buildMachineSnapshot,
+  capturePending,
+  confirmEntry,
+  correctEntry,
+  customerReportCsv,
+  customerReportRows,
+  discardEntry,
+  effectiveEntries,
+  emptyManualData,
+  EMPTY_FILTER,
+  LedgerError,
+  makeFingerprint,
+  registerManual,
+  saveDraft,
+  summarize,
+  validateManualData,
+  type LedgerEntry,
+} from './ledger'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
 
@@ -453,8 +472,305 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     ),
   )
 
+  // ---------- 12. 作业台账业务规则（纯内存账本，不触碰 localStorage） ----------
+  const ledgerChecks = buildLedgerChecks()
+  checks.push(...ledgerChecks)
+
   const totalMs = performance.now() - t0
   return { checks, summaries, totalMs }
+}
+
+/** 作业台账：整场快照 / 重复拦截 / 待确认丢弃 / 归档冻结 / 更正留痕 / 项目删除可查 / 汇总与客户清单 */
+function buildLedgerChecks(): CheckResult[] {
+  const out: CheckResult[] = []
+  // 构造两场作业：两个形状、两个图层、批量排版 2×2
+  const mkContour = (id: string, w: number, h: number, layer: number) => {
+    const c = rectContour(id, 0, 0, w, h)
+    return { c, layer }
+  }
+  const proj = {
+    id: 'p_ledger',
+    name: '台账测试窗花',
+    createdAt: 1,
+    updatedAt: 2,
+    shapes: [
+      { id: 's_a', name: '形状甲', layer: 0, contours: [mkContour('c_a', 100, 100, 0).c] },
+      { id: 's_b', name: '形状乙', layer: 1, contours: [mkContour('c_b', 60, 40, 1).c] },
+    ],
+    settings: { ...DEFAULT_CUT_SETTINGS },
+    export: { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 } as Project['export'],
+    sheet: { widthMm: 300, heightMm: 300, name: '300×300 方纸' },
+    materialId: 'mat-x',
+    layerNames: ['图层 1', '图层 2'],
+    batch: { enabled: true, rows: 2, cols: 2, gapXMm: 5, gapYMm: 5, sharedEdge: false, mode: 'repeat' },
+    batchShapeId: 's_a',
+  } as unknown as Project
+  const material: MaterialPreset = { id: 'mat-x', name: '宣纸精细', paper: 'xuan', force: 60, speedMmS: 60, passes: 2, bladeOffsetMm: 0.2, backing: '白色软垫板' }
+
+  const { job, shape } = storeJobOf(proj)
+  const machine = buildMachineSnapshot(proj, job, material, true, 'PLT')
+  const fp = makeFingerprint(proj, machine)
+
+  // ① 多形状 / 多图层 / 批量按整场合起来算：长度 × 遍数、段数、份数、图层数
+  const expectCut = job.cutLengthMm
+  out.push(
+    ok(
+      'ledger-whole-session',
+      '台账：整场刀路总长、段数、形状图层与遍数按整场合起来算（含批量排版）',
+      machine.segmentCount === job.runCount &&
+        Math.abs(machine.cutLengthMm - expectCut) < 1e-6 &&
+        Math.abs(machine.totalCutLengthMm - expectCut * 2) < 1e-6 &&
+        machine.layerCount === 1 && // 批量排版只排 batchShape（形状甲），整场 1 图层、4 份
+        machine.shapeCount === 4 &&
+        machine.batchCopies === 4 &&
+        machine.passes === 2,
+      `批量 2×2：${machine.segmentCount} 段、单遍 ${machine.cutLengthMm.toFixed(1)}mm、整场 ${machine.totalCutLengthMm.toFixed(1)}mm（×2 遍）、${machine.shapeCount} 形状 / ${machine.layerCount} 图层；${shape ? 'batch' : 'normal'}`,
+    ),
+  )
+
+  // 非批量：两个形状两个图层都在
+  const proj2: Project = { ...proj, batch: { ...proj.batch!, enabled: false } } as Project
+  const { job: job2 } = storeJobOf(proj2)
+  const m2 = buildMachineSnapshot(proj2, job2, material, false, 'PLT')
+  out.push(
+    ok(
+      'ledger-multi-layer',
+      '台账：非批量时多形状多图层全部并入一场',
+      m2.shapeCount === 2 && m2.layerCount === 2 && m2.segmentCount === job2.runCount,
+      `非批量：${m2.shapeCount} 形状 / ${m2.layerCount} 图层 / ${m2.segmentCount} 段`,
+    ),
+  )
+
+  // ② 导出自动待确认 + 同作业重复拦下（含 pending 与 archived 两阶段）
+  const entries: LedgerEntry[] = []
+  const cap1 = capturePending(entries, proj, machine, fp)
+  const cap2 = capturePending(entries, proj, machine, fp)
+  const autoEntry = cap1.kind === 'created' ? cap1.entry : null
+  out.push(
+    ok(
+      'ledger-auto-capture-duplicate',
+      '台账：导出自动记待确认；同一次作业重复导出被认出拦下',
+      cap1.kind === 'created' && cap1.entry.status === 'pending' && cap2.kind === 'duplicate' && cap2.entry.id === autoEntry?.id,
+      `首次导出 → ${cap1.kind}；再次导出同一场 → ${cap2.kind}（指纹 ${fp}）`,
+    ),
+  )
+
+  // ③ 校验：缺操作人 / 废品超用纸 / 有废品无原因
+  const bad = validateManualData({ ...emptyManualData('2026-09-01'), operator: '', workMinutes: 30 })
+  const badReason = validateManualData({ ...emptyManualData('2026-09-01'), operator: '王师傅', sheetsUsed: 1, wasteCount: 2 })
+  const badWasteReason = validateManualData({ ...emptyManualData('2026-09-01'), operator: '王师傅', workMinutes: 30, sheetsUsed: 2, wasteCount: 1 })
+  const good = validateManualData({ ...emptyManualData('2026-09-01'), operator: '王师傅', workMinutes: 45, wasteCount: 1, wasteReason: '宣纸起毛' })
+  out.push(
+    ok(
+      'ledger-validate',
+      '台账：人工补录校验（操作人、用纸 ≥ 废品、废品必填原因、工时 > 0）',
+      bad.some((m) => m.includes('操作人')) &&
+        badReason.some((m) => m.includes('超过')) &&
+        badWasteReason.some((m) => m.includes('废品原因')) &&
+        good.length === 0,
+      `缺操作人报「${bad[0]}」；废品 2 > 用纸 1 报「${badReason.find((m) => m.includes('超过'))}」；有废品无原因报「${badWasteReason.find((m) => m.includes('原因'))}」；合法数据 ${good.length} 条错误`,
+    ),
+  )
+
+  // ④ 待确认可以补录后确认归档，生成编号；pending 可丢弃
+  let threw = false
+  try {
+    confirmEntry(entries, autoEntry!.id, { ...emptyManualData('2026-09-01'), operator: '', workMinutes: 30 })
+  } catch {
+    threw = true
+  }
+  const archived = confirmEntry(
+    entries,
+    autoEntry!.id,
+    { operator: '王师傅', customer: '李家婚庆', workDate: '2026-09-01', sheetsUsed: 3, workMinutes: 40, wasteCount: 1, wasteReason: '走位', note: '' },
+  )
+  const codeOk = /^LZ-20260901-001$/.test(archived.code)
+  const pendingProj: Project = { ...proj, id: 'p_ledger_2' } as Project
+  const cap3 = capturePending(entries, pendingProj, m2, makeFingerprint(pendingProj, m2))
+  const pendingId = cap3.kind === 'created' ? cap3.entry.id : ''
+  discardEntry(entries, pendingId)
+  const discardedGone = !entries.some((e) => e.id === pendingId)
+  let discardArchivedThrew = false
+  try {
+    discardEntry(entries, archived.id)
+  } catch {
+    discardArchivedThrew = true
+  }
+  out.push(
+    ok(
+      'ledger-confirm-discard',
+      '台账：待确认补录校验后归档编号；待确认可丢弃，归档记录不能丢弃',
+      threw && codeOk && archived.status === 'archived' && discardedGone && discardArchivedThrew,
+      `编号 ${archived.code}；校验未过抛错 = ${threw}；pending 丢弃后消失 = ${discardedGone}；丢弃归档被拒 = ${discardArchivedThrew}`,
+    ),
+  )
+
+  // ⑤ 归档后不可改（saveDraft / confirm 再调都拒绝）
+  let frozen1 = false
+  let frozen2 = false
+  try {
+    saveDraft(entries, archived.id, { sheetsUsed: 99 })
+  } catch {
+    frozen1 = true
+  }
+  try {
+    confirmEntry(entries, archived.id, archived.data)
+  } catch {
+    frozen2 = true
+  }
+  out.push(
+    ok(
+      'ledger-archive-frozen',
+      '台账：归档后业务数据冻结，任何修改入口都拒绝',
+      frozen1 && frozen2 && archived.data.sheetsUsed === 3,
+      `saveDraft 拒绝 = ${frozen1}；重复确认拒绝 = ${frozen2}；用纸仍为 ${archived.data.sheetsUsed} 张`,
+    ),
+  )
+
+  // ⑥ 同作业手工登记默认拦下，force=false 抛错带 duplicateOf；force=true（补切）放行且单独编号
+  let dupBlocked: LedgerEntry | null = null
+  try {
+    registerManual(entries, proj, machine, fp, { ...archived.data, customer: '重复单' })
+  } catch (e) {
+    dupBlocked = e instanceof LedgerError ? e.duplicateOf : null
+  }
+  const recut = registerManual(entries, proj, machine, fp, { ...archived.data, workDate: '2026-09-02', customer: '补切' }, true)
+  out.push(
+    ok(
+      'ledger-duplicate-force',
+      '台账：重复登记默认拦下并指明是哪一单；确认补切可强制登记',
+      dupBlocked?.id === archived.id && recut.id !== archived.id && /^LZ-20260902-001$/.test(recut.code),
+      `默认登记被拦，指向 ${dupBlocked?.code ?? '无'}；强制补切编号 ${recut.code}`,
+    ),
+  )
+
+  // ⑦ 更正：不改原单、新增更正单并写明原因、双向关联、原单退出有效集合
+  let noReasonThrew = false
+  try {
+    correctEntry(entries, archived.id, { ...archived.data, workMinutes: 60 }, '  ')
+  } catch {
+    noReasonThrew = true
+  }
+  const corrected = correctEntry(
+    entries,
+    archived.id,
+    { ...archived.data, sheetsUsed: 4, workMinutes: 55, wasteCount: 1, wasteReason: '走位（复核为 1 张）' },
+    '工时与用纸登记有误，复核派工单后更正',
+  )
+  const originalStill = entries.find((e) => e.id === archived.id)!
+  out.push(
+    ok(
+      'ledger-correction-audit',
+      '台账：更正只能新增记录并写明原因；原单业务数据不动、双向关联、退出汇总',
+      noReasonThrew &&
+        corrected.source === 'correction' &&
+        corrected.correctsEntryId === archived.id &&
+        originalStill.supersededByEntryId === corrected.id &&
+        originalStill.data.sheetsUsed === 3 &&
+        originalStill.data.workMinutes === 40 &&
+        !effectiveEntries(entries).some((e) => e.id === archived.id) &&
+        effectiveEntries(entries).some((e) => e.id === corrected.id) &&
+        corrected.code.startsWith('LZ-20260901-'),
+      `原单 ${originalStill.code} 用纸仍 ${originalStill.data.sheetsUsed} 张；更正单 ${corrected.code}；无原因被拒 = ${noReasonThrew}`,
+    ),
+  )
+
+  // 已更正的单不能再次更正（应对最新更正单再更正）
+  let correctDeadThrew = false
+  try {
+    correctEntry(entries, archived.id, corrected.data, '再改')
+  } catch {
+    correctDeadThrew = true
+  }
+  const recorrect = correctEntry(entries, corrected.id, { ...corrected.data, workMinutes: 50 }, '工时再核')
+  out.push(
+    ok(
+      'ledger-correction-chain',
+      '台账：只能对最新有效单更正，更正链始终指向最新',
+      correctDeadThrew && corrected.supersededByEntryId === recorrect.id && recorrect.correctsEntryId === corrected.id,
+      `对旧单再更正被拒 = ${correctDeadThrew}；最新更正单 ${recorrect.code}`,
+    ),
+  )
+
+  // ⑧ 删除纹样项目后台账不消失（快照独立、按 id 仍可查）
+  const survives = entries.find((e) => e.id === recut.id)!
+  const survivesOk =
+    survives.projectId === 'p_ledger' &&
+    survives.projectNameSnapshot === '台账测试窗花' &&
+    survives.machine.cutLengthMm > 0 &&
+    survives.machine.paper === 'xuan'
+  out.push(
+    ok(
+      'ledger-project-delete-survive',
+      '台账：纹样项目删除后台账不消失，名称与整场数据冗余可查',
+      survivesOk,
+      `项目 id ${survives.projectId} 离开项目库后，台账仍保留「${survives.projectNameSnapshot}」、纸张 ${survives.machine.paperLabel} 与 ${survives.machine.segmentCount} 段刀路快照`,
+    ),
+  )
+
+  // ⑨ 汇总：时间段 / 纸张 / 操作人口径，用纸、米数、工时
+  const sAll = summarize(entries, EMPTY_FILTER, 'none').total
+  const sPaper = summarize(entries, EMPTY_FILTER, 'paper').rows
+  const sDate = summarize(entries, { ...EMPTY_FILTER, dateFrom: '2026-09-02', dateTo: '2026-09-02' }, 'none').total
+  // 有效单：recut（09-02，3 张 40 分钟）+ recorrect（09-01，4 张 50 分钟）
+  const totalMeters = (recut.machine.totalCutLengthMm + recorrect.machine.totalCutLengthMm) / 1000
+  out.push(
+    ok(
+      'ledger-summary',
+      '台账：按时间段 / 纸张 / 操作人汇总用纸、刀路米数、工时（旧单不重复计）',
+      sAll.jobs === 2 &&
+        sAll.sheets === 7 &&
+        sAll.waste === 2 &&
+        Math.abs(sAll.cutMeters - totalMeters) < 1e-6 &&
+        Math.abs(sAll.workHours - (40 + 50) / 60) < 1e-6 &&
+        sPaper.length === 1 &&
+        sPaper[0].key === 'xuan' &&
+        sDate.jobs === 1 &&
+        sDate.sheets === 3,
+      `合计 ${sAll.jobs} 单 / ${sAll.sheets} 张 / ${sAll.cutMeters.toFixed(2)} 米 / ${sAll.workHours.toFixed(2)} 时；按纸张 ${sPaper.length} 组（${sPaper.map((r) => r.label).join('、')}）；09-02 筛选 ${sDate.jobs} 单`,
+    ),
+  )
+
+  // ⑩ 客户清单导出：CSV 含表头、逐行与合计，旧单与待确认不出现
+  const csv = customerReportCsv(entries, EMPTY_FILTER)
+  const rows = customerReportRows(entries, EMPTY_FILTER)
+  const csvOk =
+    csv.startsWith('﻿') &&
+    csv.includes('台账编号') &&
+    csv.includes('合计') &&
+    rows.length === 2 &&
+    rows.every((r) => r.code) &&
+    !csv.includes(originalStill.code)
+  out.push(
+    ok(
+      'ledger-customer-export',
+      '台账：客户清单可导出（编号/日期/纸张/米数/用纸/工时/操作人，含合计，旧单不泄露）',
+      csvOk,
+      `CSV ${csv.split('\r\n').length} 行（含 BOM/表头/合计），明细 ${rows.length} 单；被更正的 ${originalStill.code} 不在清单`,
+    ),
+  )
+
+  return out
+}
+
+/** 从项目构造排版任务（不依赖全局 store，复用 buildJob） */
+function storeJobOf(p: Project): { job: Job; shape: Shape | null; isBatch: boolean } {
+  const start = { x: 0, y: 0 }
+  const material = { id: 'mat-x', name: '宣纸精细', paper: 'xuan', force: 60, speedMmS: 60, passes: 2, bladeOffsetMm: 0.2, backing: '白色软垫板' }
+  const map = new Map<string, ComputedShape>()
+  for (const s of p.shapes) {
+    if (p.batch?.enabled && p.batchShapeId === s.id) {
+      const tiled = buildBatchShape(s, p.batch)
+      map.set(tiled.id, computeShape(tiled, p.settings, material))
+      const layers = Array.from(new Set([tiled.layer]))
+      const job = buildJob([tiled], map, layers, { sharedEdge: p.batch.sharedEdge, start })
+      return { job, shape: tiled, isBatch: true }
+    }
+  }
+  for (const s of p.shapes) map.set(s.id, computeShape(s, p.settings, material))
+  const layers = Array.from(new Set(p.shapes.map((s) => s.layer))).sort((a, b) => a - b)
+  const job = buildJob(p.shapes, map, layers, { sharedEdge: false, start })
+  return { job, shape: null, isBatch: false }
 }
 
 /** 矩形轮廓 */

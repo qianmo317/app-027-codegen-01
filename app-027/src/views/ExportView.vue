@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import PreviewCanvas from '@/components/PreviewCanvas.vue'
 import { store } from '@/logic/store'
@@ -17,10 +17,15 @@ import {
 } from '@/logic/exporters'
 import { downloadText, sanitizeFilename } from '@/logic/download'
 import { boundsOf } from '@/logic/geometry'
+import { captureFromExport, type LedgerEntry } from '@/logic/ledger'
 
 const route = useRoute()
 const router = useRouter()
 const canvas = ref<InstanceType<typeof PreviewCanvas> | null>(null)
+
+onMounted(() => {
+  store.loadState()
+})
 
 const projectId = computed(() => String(route.params.id))
 const project = computed(() => store.getProject(projectId.value) ?? null)
@@ -135,11 +140,29 @@ function mime(): string {
   return cfg.value.format === 'svg' ? 'image/svg+xml;charset=utf-8' : 'text/plain;charset=utf-8'
 }
 
+// 导出刀路自动记台账：待确认 / 重复拦下提示
+const ledgerNotice = ref<{ kind: 'created' | 'duplicate' | 'empty'; text: string; entry: LedgerEntry | null } | null>(null)
+
 function doDownload(): void {
   const p = project.value
   if (!p || !stats.value) return
   const name = `${sanitizeFilename(p.name)}_${cfg.value.format}.${ext()}`
   downloadText(name, stats.value.text, mime())
+  // 只有真正下载刀路文件才自动记一笔；A4 检查图不算作业
+  const res = captureFromExport(p.id, cfg.value.format)
+  if (!res) {
+    ledgerNotice.value = { kind: 'empty', text: '当前没有可切割的刀路段，未记录台账。', entry: null }
+  } else if (res.kind === 'created') {
+    ledgerNotice.value = { kind: 'created', text: '已按整场作业自动记一笔到台账（待确认），请到台账页补录用纸、工时与废品后归档。', entry: res.entry }
+  } else {
+    ledgerNotice.value = {
+      kind: 'duplicate',
+      text: res.entry.status === 'pending'
+        ? '这场刀路已有一条待确认记录，没有重复登记，请到台账页确认或丢弃。'
+        : `这场刀路已登记过（编号 ${res.entry.code}），同一次作业重复导出不再重复记账；如确属补切，可在台账页手工强制登记。`,
+      entry: res.entry,
+    }
+  }
 }
 
 // ---------------- A4 检查图 ----------------
@@ -178,6 +201,12 @@ function downloadA4(): void {
 <template>
   <div v-if="!project" class="splash">项目不存在，请返回纹样库 <RouterLink to="/">返回</RouterLink></div>
   <div v-else class="workbench-export">
+    <div v-if="ledgerNotice" class="ledger-banner" :class="ledgerNotice.kind">
+      <span>{{ ledgerNotice.text }}</span>
+      <span class="spacer"></span>
+      <RouterLink class="tiny-link" to="/ledger">前往台账 →</RouterLink>
+      <button class="tiny ghost" @click="ledgerNotice = null">知道了</button>
+    </div>
     <div class="panel canvas-panel">
       <div class="panel-head">
         导出预览
@@ -338,6 +367,45 @@ function downloadA4(): void {
 </template>
 
 <style scoped>
+.ledger-banner {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  border: 1px solid;
+}
+
+.ledger-banner .spacer {
+  flex: 1 1 auto;
+}
+
+.ledger-banner.created {
+  background: rgba(71, 192, 122, 0.12);
+  border-color: rgba(71, 192, 122, 0.4);
+  color: #9fe0b8;
+}
+
+.ledger-banner.duplicate {
+  background: rgba(255, 200, 87, 0.1);
+  border-color: rgba(255, 200, 87, 0.4);
+  color: var(--warn);
+}
+
+.ledger-banner.empty {
+  background: rgba(255, 107, 107, 0.12);
+  border-color: rgba(255, 107, 107, 0.4);
+  color: #ffb3b3;
+}
+
+.tiny-link {
+  font-size: 11.5px;
+  text-decoration: underline;
+  color: inherit;
+}
+
 .code-preview {
   background: #0e1216;
   border: 1px solid var(--line);

@@ -83,8 +83,9 @@ const faqOpen = ref<number | null>(0)
       <h2 class="sec">验收自检（第 10 节标准）</h2>
       <div class="card">
         <p class="hint">
-          一键跑完第 10 节全部验收用例：导入 10 个真实窗花 SVG、连刀点宽度与几何偏差、碎片必连刀、长度规则数量、嵌套 3 层、先内后外、2-opt 跳刀缩短
-          ≥15%、PLT 坐标范围与左下原点、G-code 单位与进给、A4 校验尺 1:1、5000 点性能、刀补自交裁剪。
+          一键跑完全部验收用例：导入 10 个真实窗花 SVG、连刀点宽度与几何偏差、碎片必连刀、长度规则数量、嵌套 3 层、先内后外、2-opt 跳刀缩短
+          ≥15%、PLT 坐标范围与左下原点、G-code 单位与进给、A4 校验尺 1:1、5000 点性能、刀补自交裁剪；
+          以及作业台账：整场快照合并、重复登记拦截、待确认/丢弃、归档冻结、更正留痕、项目删除可查、汇总与客户清单导出。
         </p>
         <div class="btn-row" style="margin: 8px 0">
           <button class="primary" :disabled="running" @click="run">{{ running ? '自检中…' : '运行验收自检' }}</button>

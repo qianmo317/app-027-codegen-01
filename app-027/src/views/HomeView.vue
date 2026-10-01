@@ -95,7 +95,7 @@ function onDrop(e: DragEvent): void {
 }
 
 function remove(id: string, name: string): void {
-  if (confirm(`删除项目「${name}」？该操作不可撤销。`)) store.deleteProject(id)
+  if (confirm(`删除项目「${name}」？该操作不可撤销。\n注意：该项目已登记的作业台账不会消失，仍可在台账中查询。`)) store.deleteProject(id)
   if (state.lastError) error.value = state.lastError
 }
 
