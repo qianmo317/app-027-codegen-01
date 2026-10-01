@@ -420,6 +420,7 @@ const boundsInfo = computed(() => {
           </table>
           <div class="btn-row" style="margin-top: 6px">
             <button class="tiny primary" @click="printCard">打印工艺卡</button>
+            <button class="tiny" @click="router.push(`/ledger?new=1&project=${project.id}`)">登记台账</button>
             <button class="tiny" @click="router.push('/materials')">材料库</button>
             <button class="tiny" @click="router.push(`/export/${project.id}`)">导出刀路</button>
           </div>

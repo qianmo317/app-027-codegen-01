@@ -6,6 +6,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/layout/:id', name: 'layout', component: () => import('./views/LayoutView.vue') },
   { path: '/export/:id', name: 'export', component: () => import('./views/ExportView.vue') },
   { path: '/materials', name: 'materials', component: () => import('./views/MaterialsView.vue') },
+  { path: '/ledger', name: 'ledger', component: () => import('./views/LedgerView.vue') },
   { path: '/help', name: 'help', component: () => import('./views/HelpView.vue') },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]

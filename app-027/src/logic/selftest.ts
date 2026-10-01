@@ -7,6 +7,24 @@ import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import {
+  __makeEntryForTest,
+  __resetLedgerForTest,
+  __restoreLedgerForTest,
+  __setLedgerSaveSuspended,
+  __snapshotLedgerForTest,
+  addCorrection,
+  archiveEntry,
+  buildAutoSnapshot,
+  createManualEntry,
+  discardEntry,
+  effectiveOf,
+  markProjectDeleted,
+  registerExportedJob,
+  summarize,
+  updateEntry,
+  type CaptureInput,
+} from './ledger'
 
 export type CheckResult = {
   id: string
@@ -453,8 +471,221 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     ),
   )
 
+  // ---------- 10. 作业台账 ----------
+  const ledgerBackup = __snapshotLedgerForTest()
+  __setLedgerSaveSuspended(true)
+  __resetLedgerForTest()
+  const ledgerDetails: string[] = []
+
+  // 10.1 导出自动带出 + 整场合算（多形状多图层）
+  let autoOk = false
+  let autoDetail = '缺导出用例'
+  if (exportShape) {
+    const comp2 = computeShape(exportShape, settings, mat)
+    const shape2: Shape = { id: 'st_ledger_b', name: '台账多形状用例', contours: exportShape.contours, layer: 1 }
+    const job2 = buildJob(
+      [exportShape, shape2],
+      new Map([
+        [exportShape.id, comp2],
+        [shape2.id, comp2],
+      ]),
+      [0, 1],
+      { sharedEdge: false, start: { x: 0, y: 0 } },
+    )
+    const cap: CaptureInput = {
+      projectId: 'p-ledger',
+      projectName: '台账自检项目',
+      formName: `${exportShape.name}、${shape2.name}`,
+      shapeCount: 2,
+      layerCount: 2,
+      batch: false,
+      batchRows: 1,
+      batchCols: 1,
+      job: job2,
+      material: mat,
+      sheet: { widthMm: 210, heightMm: 297, name: 'A4 纵向' },
+      bridgeWidthMm: settings.bridgeWidthMm,
+      exportFormat: 'plt',
+    }
+    const snap = buildAutoSnapshot(cap)
+    autoOk =
+      Math.abs(snap.cutLengthMm - job2.cutLengthMm) < 0.01 &&
+      snap.segmentCount === job2.runCount &&
+      snap.shapeCount === 2 &&
+      snap.layerCount === 2 &&
+      snap.paper === mat.paper &&
+      snap.force === mat.force &&
+      snap.speedMmS === mat.speedMmS &&
+      snap.passes === mat.passes &&
+      Math.abs(snap.actualCutMm - job2.cutLengthMm * mat.passes) < 0.01
+    autoDetail = `整场合并：刀路 ${snap.cutLengthMm.toFixed(1)}mm / ${snap.segmentCount} 段 / ${snap.shapeCount} 形状 / ${snap.layerCount} 图层 / ${snap.paperLabel}｜刀压 ${snap.force} 速度 ${snap.speedMmS} 遍数 ${snap.passes}｜含遍数走刀 ${snap.actualCutMm.toFixed(1)}mm`
+
+    // 10.2 导出自动记一笔 → pending
+    const r1 = registerExportedJob(cap)
+    const pending = 'entry' in r1 ? r1.entry : null
+    autoOk = autoOk && !!pending && pending?.status === 'pending' && pending?.source === 'export_auto'
+
+    // 10.3 同一次作业重复导出被拦下（不同格式也算同一次）
+    if (pending) {
+      const capG = { ...cap, exportFormat: 'gcode' }
+      const r2 = registerExportedJob(capG)
+      const blockedAgain = 'duplicate' in r2 && r2.duplicate.id === pending.id
+      autoOk = autoOk && blockedAgain
+      autoDetail += `｜重复导出（G-code）拦截 = ${blockedAgain}`
+
+      // 丢弃后可重新记下
+      discardEntry(pending.id, '自检：误导出，丢弃')
+      const r3 = registerExportedJob(cap)
+      const reRegistered = 'entry' in r3
+      autoOk = autoOk && reRegistered
+      autoDetail += '｜丢弃后允许重新记下'
+      if ('entry' in r3) discardEntry(r3.entry.id, '自检清理')
+    }
+  }
+  checks.push(ok('ledger-auto', '台账：导出刀路自动带出整场刀路（多形状多图层合算：总长/段数/纸张/刀压/速度/遍数），重复登记拦下', autoOk, autoDetail))
+
+  // 手工登记两笔（不同纸张、不同操作人）
+  const today = new Date()
+  today.setHours(10, 30, 0, 0)
+  const tToday = today.getTime()
+  const yesterday = new Date(tToday - 86400000)
+  const e1 = createManualEntry(
+    {
+      jobAt: tToday,
+      projectId: 'p-a',
+      projectName: '客户甲窗花',
+      formName: '八角窗花',
+      auto: __makeEntryForTest({ auto: { paper: 'red-paper', paperLabel: '红纸（剪纸）', cutLengthMm: 2000, actualCutMm: 2000, segmentCount: 20, force: 85, speedMmS: 50, passes: 1 } }).auto,
+      manual: { sheetsUsed: 4, minutesSpent: 90, wasteSheets: 1, wasteReason: '走纸偏移', operator: '王师傅', customer: '甲', note: '' },
+    },
+  )
+  const e2 = createManualEntry(
+    {
+      jobAt: yesterday.getTime(),
+      projectId: 'p-b',
+      projectName: '乙喜字',
+      formName: '囍字',
+      auto: __makeEntryForTest({ auto: { paper: 'cardstock', paperLabel: '卡纸', cutLengthMm: 3000, actualCutMm: 3000, segmentCount: 30, force: 120, speedMmS: 40, passes: 1, shapeCount: 2, layerCount: 2 } }).auto,
+      manual: { sheetsUsed: 2, minutesSpent: 30, wasteSheets: 0, wasteReason: '', operator: '李师傅', customer: '乙', note: '' },
+    },
+  )
+  const e1e = 'entry' in e1 ? e1.entry : null
+  const e2e = 'entry' in e2 ? e2.entry : null
+  ledgerDetails.push(`手工登记 2 笔：${e1e ? '成功' : '失败'} / ${e2e ? '成功' : '失败'}`)
+
+  // 10.3b 手工登记：同一次作业（同项目同参数同长度）默认拦下，写明原因可强制再记
+  let manualDupOk = false
+  if (e1e) {
+    const again = createManualEntry({
+      jobAt: tToday,
+      projectId: 'p-a',
+      projectName: '客户甲窗花',
+      formName: '八角窗花',
+      auto: e1e.auto,
+      manual: e1e.manual,
+    })
+    const blocked = 'duplicate' in again && again.duplicate.id === e1e.id
+    const forced = createManualEntry(
+      {
+        jobAt: tToday,
+        projectId: 'p-a',
+        projectName: '客户甲窗花',
+        formName: '八角窗花',
+        auto: e1e.auto,
+        manual: { ...e1e.manual, note: '客户临时加订一单同款' },
+      },
+      { allow: true, reason: '客户当天加订同款，确属第二单' },
+    )
+    manualDupOk = blocked && 'entry' in forced && forced.entry.duplicateOfId === e1e.id
+    ledgerDetails.push(`手工重复登记默认拦截 = ${blocked}，写明原因后强制登记 = ${'entry' in forced}`)
+  }
+
+  // 10.4 归档后不可改，只能更正
+  let immutableOk = !!e1e
+  let correctionOk = false
+  let effectiveOk = false
+  let reasonRequired = false
+  if (e1e) {
+    archiveEntry(e1e.id)
+    let blocked = false
+    try {
+      updateEntry(e1e.id, { manual: { sheetsUsed: 99 } })
+    } catch {
+      blocked = true
+    }
+    immutableOk = blocked && e1e.manual.sheetsUsed === 4
+    ledgerDetails.push(`归档后修改被拒 = ${blocked}，原用纸仍为 ${e1e.manual.sheetsUsed}`)
+
+    // 更正必须写原因
+    const noReason = addCorrection(e1e.id, { manual: { sheetsUsed: 5 } }, '  ')
+    reasonRequired = 'error' in noReason
+    // 正常更正：用纸 4→5，废品 1→2 并补原因
+    const cr = addCorrection(e1e.id, { manual: { sheetsUsed: 5, wasteSheets: 2, wasteReason: '走纸偏移；第二张连刀点开大' } }, '切割后复核，实际多废一张连刀点开大的纸')
+    correctionOk = 'entry' in cr && cr.entry.status === 'archived' && cr.entry.rootId === e1e.id && e1e.manual.sheetsUsed === 4
+    if ('entry' in cr) {
+      const ef = effectiveOf(e1e)
+      effectiveOk = ef.entry.manual.sheetsUsed === 5 && ef.entry.manual.wasteSheets === 2 && !!ef.correction && ef.root.manual.sheetsUsed === 4
+      ledgerDetails.push(`更正新增 1 条（原值不改：用纸 ${ef.root.manual.sheetsUsed}；有效值：用纸 ${ef.entry.manual.sheetsUsed}、废品 ${ef.entry.manual.wasteSheets}）`)
+    }
+  }
+  checks.push(
+    ok(
+      'ledger-immutable',
+      '台账：归档后不许改，只能新增更正记录并写明原因；汇总取最新更正值，原记录原样保留。同日重复登记默认拦下、写原因可强制再记',
+      immutableOk && reasonRequired && correctionOk && effectiveOk && manualDupOk,
+      ledgerDetails.join('｜'),
+    ),
+  )
+
+  // 10.5 汇总：按时间段 / 纸张 / 操作人（用纸、米刀路、工时；已更正的取更正值）
+  const redOnly = summarize({ from: '', to: '', paper: 'red-paper', operator: '', keyword: '' })
+  const e1Effective = e1e ? effectiveOf(e1e).entry : null
+  // 红纸 = 原 1 笔（已更正：5 张/90min/2m/废品2）+ 强制再记的 1 笔（4 张/90min/2m）
+  const redSheets = redOnly.totals.sheetsUsed
+  const redCutOk = Math.abs(redOnly.totals.cutMm - 4000) < 0.001
+  const redMinOk = redOnly.totals.minutes === 180
+  const paperFilterOk =
+    e1Effective?.manual.sheetsUsed === 5 && redCutOk && redMinOk && redSheets === 9 && redOnly.rows.every((r) => r.entry.auto.paper === 'red-paper')
+
+  const wang = summarize({ from: '', to: '', paper: '', operator: '王师傅', keyword: '' })
+  const opFilterOk = wang.totals.count === 2 && wang.byOperator.length === 1 && wang.byOperator[0].key === '王师傅'
+
+  const li = summarize({ from: '', to: '', paper: '', operator: '李师傅', keyword: '' })
+  const cardOk = li.totals.count === 1 && li.totals.sheetsUsed === 2 && Math.abs(li.totals.cutMm - 3000) < 0.001 && li.totals.minutes === 30
+
+  const todayOnly = summarize({ from: dayKeyStr(tToday), to: dayKeyStr(tToday), paper: '', operator: '', keyword: '' })
+  const yOnly = summarize({ from: dayKeyStr(yesterday.getTime()), to: dayKeyStr(yesterday.getTime()), paper: '', operator: '', keyword: '' })
+  const timeOk = todayOnly.totals.count === 2 && yOnly.totals.count === 1 && yOnly.totals.sheetsUsed === 2
+  checks.push(
+    ok(
+      'ledger-summary',
+      '台账：按时间段 / 纸张 / 操作人汇总用纸（张）、刀路（米）、工时；已更正的取更正值',
+      paperFilterOk && opFilterOk && cardOk && timeOk,
+      `红纸组（含 1 条更正后 5 张 + 1 条强制同款 4 张）：${redSheets} 张 / ${(redOnly.totals.cutMm / 1000).toFixed(2)}m / ${redOnly.totals.minutes}min` +
+        `｜王师傅 ${wang.totals.count} 单｜李师傅（卡纸）${li.totals.sheetsUsed} 张/3m/30min=${cardOk}｜今天 ${todayOnly.totals.count} 单、昨天 1 单=${timeOk}`,
+    ),
+  )
+
+  // 10.6 项目删除后台账仍在
+  let deleteOk = false
+  if (e2e) {
+    markProjectDeleted('p-b')
+    deleteOk = e2e.projectDeleted === true
+    const still = summarize({ from: '', to: '', paper: '', operator: '', keyword: '喜字' })
+    deleteOk = deleteOk && still.rows.length === 1
+  }
+  checks.push(ok('ledger-delete-project', '台账：删除纹样项目后台账不消失，仍可查询（仅标记项目已删）', deleteOk, deleteOk ? 'p-b 删除后，记录保留并标记，按关键字仍可查到' : '未验证'))
+
+  __restoreLedgerForTest(ledgerBackup)
+
   const totalMs = performance.now() - t0
   return { checks, summaries, totalMs }
+}
+
+function dayKeyStr(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
 /** 矩形轮廓 */

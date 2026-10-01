@@ -17,6 +17,7 @@ import {
 } from '@/logic/exporters'
 import { downloadText, sanitizeFilename } from '@/logic/download'
 import { boundsOf } from '@/logic/geometry'
+import { ledger, type LedgerEntry } from '@/logic/ledger'
 
 const route = useRoute()
 const router = useRouter()
@@ -135,11 +136,48 @@ function mime(): string {
   return cfg.value.format === 'svg' ? 'image/svg+xml;charset=utf-8' : 'text/plain;charset=utf-8'
 }
 
+// ---------------- 导出刀路自动记一笔（待人工确认 / 丢弃） ----------------
+const ledgerNotice = ref<{ kind: 'new' | 'duplicate'; entry: LedgerEntry } | null>(null)
+
+function registerCut(): void {
+  const p = project.value
+  if (!p || !job.value || !material.value || !stats.value || !jobData.value) return
+  const d = jobData.value
+  const res = ledger.registerExportedJob({
+    projectId: p.id,
+    projectName: p.name,
+    formName: shapesForCanvas.value.map((s) => s.name).join('、'),
+    shapeCount: d.isBatch && d.shape ? 1 : p.shapes.length,
+    layerCount: store.layerOrderOf(p).length,
+    batch: d.isBatch && !!p.batch?.enabled,
+    batchRows: p.batch?.rows ?? 1,
+    batchCols: p.batch?.cols ?? 1,
+    job: job.value,
+    material: material.value,
+    sheet: p.sheet,
+    bridgeWidthMm: p.settings.bridgeWidthMm,
+    exportFormat: cfg.value.format,
+  })
+  if ('duplicate' in res) ledgerNotice.value = { kind: 'duplicate', entry: res.duplicate }
+  else ledgerNotice.value = { kind: 'new', entry: res.entry }
+}
+
 function doDownload(): void {
   const p = project.value
   if (!p || !stats.value) return
   const name = `${sanitizeFilename(p.name)}_${cfg.value.format}.${ext()}`
   downloadText(name, stats.value.text, mime())
+  registerCut()
+}
+
+function gotoLedger(): void {
+  void router.push('/ledger')
+}
+
+function fmtNotice(e: LedgerEntry): string {
+  const d = new Date(e.jobAt)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())} · ${e.projectName}`
 }
 
 // ---------------- A4 检查图 ----------------
@@ -178,6 +216,18 @@ function downloadA4(): void {
 <template>
   <div v-if="!project" class="splash">项目不存在，请返回纹样库 <RouterLink to="/">返回</RouterLink></div>
   <div v-else class="workbench-export">
+    <div v-if="ledgerNotice" class="ledger-toast" :class="ledgerNotice.kind === 'duplicate' ? 'dup' : 'new'">
+      <template v-if="ledgerNotice.kind === 'new'">
+        本次刀路已自动记入<b>作业台账</b>（待确认）：{{ ledgerNotice.entry.auto.cutLengthMm.toFixed(0) }}mm /
+        {{ ledgerNotice.entry.auto.segmentCount }} 段 / {{ ledgerNotice.entry.auto.paperLabel }}，请到台账补录用纸、工时与废品后确认。
+      </template>
+      <template v-else>
+        识别为同一次作业的重复导出（当天已有一笔：{{ fmtNotice(ledgerNotice.entry) }}），未重复登记。
+      </template>
+      <span class="spacer"></span>
+      <button class="tiny" @click="gotoLedger">去台账{{ ledgerNotice.kind === 'new' ? '确认' : '查看' }}</button>
+      <button class="tiny ghost" @click="ledgerNotice = null">知道了</button>
+    </div>
     <div class="panel canvas-panel">
       <div class="panel-head">
         导出预览
@@ -210,6 +260,7 @@ function downloadA4(): void {
       <div class="panel-head">
         导出设置
         <span class="spacer"></span>
+        <RouterLink class="tiny" to="/ledger" style="margin-right: 6px">作业台账</RouterLink>
         <button class="tiny primary" @click="doDownload">下载 {{ cfg.format.toUpperCase() }}</button>
       </div>
       <div class="panel-body">
@@ -338,6 +389,30 @@ function downloadA4(): void {
 </template>
 
 <style scoped>
+.ledger-toast {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  border: 1px solid rgba(71, 192, 122, 0.45);
+  background: rgba(71, 192, 122, 0.12);
+  color: #9fe0b8;
+}
+
+.ledger-toast.dup {
+  border-color: rgba(255, 200, 87, 0.45);
+  background: rgba(255, 200, 87, 0.1);
+  color: var(--warn);
+}
+
+.ledger-toast .spacer {
+  margin-left: auto;
+}
+
 .code-preview {
   background: #0e1216;
   border: 1px solid var(--line);

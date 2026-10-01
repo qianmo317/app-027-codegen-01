@@ -17,6 +17,7 @@ import { buildBatchShape, buildJob, type Job } from './job'
 import { uid } from './geometry'
 import { importSvgText, type ImportResult } from './importer'
 import { defaultMaterials } from '@/data/materials'
+import { markProjectDeleted } from './ledger'
 
 const LS_KEY = 'papercut-plotter-studio/v1'
 
@@ -223,6 +224,8 @@ export function deleteProject(id: string): void {
   const i = state.projects.findIndex((p) => p.id === id)
   if (i >= 0) {
     state.projects.splice(i, 1)
+    // 台账不随项目删除：只打标记，历史作业仍可查
+    markProjectDeleted(id)
     scheduleSave()
   }
 }
